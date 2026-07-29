@@ -4,9 +4,8 @@ use serde::Deserialize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tauri::Emitter;
 
-use crate::sftp_client::{FileEntry, FileEntryType, TransferProgressEvent};
+use crate::sftp_client::{FileEntry, FileEntryType, ProgressEmitter};
 
 /// Configuration for an FTP/FTPS connection.
 #[derive(Debug, Clone, Deserialize)]
@@ -39,15 +38,13 @@ macro_rules! ftp_stream {
     }};
 }
 
-/// A reader that wraps in-memory file data and emits `transfer-progress`
-/// events as bytes are consumed by the FTP upload stream.
+/// A reader that wraps in-memory file data and emits throttled
+/// `transfer-progress` events as bytes are consumed by the FTP upload stream.
 struct ProgressReader {
     data: Vec<u8>,
     position: usize,
     total: usize,
-    start: std::time::Instant,
-    app_handle: tauri::AppHandle,
-    transfer_id: String,
+    emitter: ProgressEmitter,
 }
 
 impl async_std::io::Read for ProgressReader {
@@ -64,24 +61,14 @@ impl async_std::io::Read for ProgressReader {
         buf[..to_read].copy_from_slice(&self.data[self.position..self.position + to_read]);
         self.position += to_read;
 
-        // Emit progress event
-        let elapsed = self.start.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            (self.position as f64) / elapsed
+        // Throttled progress event; always emit the final one so the UI
+        // reaches 100%.
+        let position = self.position as u64;
+        if self.position >= self.total {
+            self.emitter.finish(position);
         } else {
-            0.0
-        };
-        let progress = (self.position as f64 / self.total as f64) * 100.0;
-        let _ = self.app_handle.emit(
-            "transfer-progress",
-            TransferProgressEvent {
-                transfer_id: self.transfer_id.clone(),
-                progress,
-                bytes_transferred: self.position as u64,
-                total_bytes: self.total as u64,
-                speed,
-            },
-        );
+            self.emitter.report(position);
+        }
 
         Poll::Ready(Ok(to_read))
     }
@@ -259,13 +246,12 @@ impl FtpClient {
                 anyhow::anyhow!("Failed to download file '{}': {}", remote_path, e)
             })?;
 
-            // Read in chunks so we can report progress
+            // Read in chunks so we can report progress. We don't know the
+            // total size for FTP downloads ahead of time, so progress stays
+            // at 0% but bytes transferred and speed are shown.
             let mut buf = Vec::new();
             let mut chunk = vec![0u8; 32768];
-            let start = std::time::Instant::now();
-            let should_emit = app_handle.is_some() && transfer_id.is_some();
-            // We don't know the total size for FTP downloads ahead of time,
-            // so we report bytes downloaded without a percentage.
+            let mut emitter = ProgressEmitter::new(app_handle, transfer_id, 0);
             loop {
                 let n = data_stream.read(&mut chunk).await.map_err(|e| {
                     anyhow::anyhow!("Failed to read download stream: {}", e)
@@ -275,26 +261,12 @@ impl FtpClient {
                 }
                 buf.extend_from_slice(&chunk[..n]);
 
-                if should_emit {
-                    let bytes = buf.len() as u64;
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let speed = if elapsed > 0.0 {
-                        (bytes as f64) / elapsed
-                    } else {
-                        0.0
-                    };
-                    // Report with unknown total (progress stays near 0 but speed is shown)
-                    let _ = app_handle.unwrap().emit(
-                        "transfer-progress",
-                        TransferProgressEvent {
-                            transfer_id: transfer_id.unwrap().to_string(),
-                            progress: 0.0,
-                            bytes_transferred: bytes,
-                            total_bytes: 0,
-                            speed,
-                        },
-                    );
+                if let Some(emitter) = emitter.as_mut() {
+                    emitter.report(buf.len() as u64);
                 }
+            }
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.finish(buf.len() as u64);
             }
             s.finalize_retr_stream(data_stream).await.map_err(|e| {
                 anyhow::anyhow!("Failed to finalize download: {}", e)
@@ -322,16 +294,12 @@ impl FtpClient {
             .map_err(|e| anyhow::anyhow!("Failed to read local file '{}': {}", local_path, e))?;
         let total_bytes = data.len() as u64;
 
-        let should_emit = app_handle.is_some() && transfer_id.is_some();
-
-        if should_emit {
+        if let Some(emitter) = ProgressEmitter::new(app_handle, transfer_id, total_bytes) {
             let mut reader = ProgressReader {
                 data,
                 position: 0,
                 total: total_bytes as usize,
-                start: std::time::Instant::now(),
-                app_handle: app_handle.unwrap().clone(),
-                transfer_id: transfer_id.unwrap().to_string(),
+                emitter,
             };
             ftp_stream!(self, s => {
                 s.put_file(remote_path, &mut reader).await.map_err(|e| {

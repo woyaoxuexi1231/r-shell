@@ -21,6 +21,87 @@ pub struct TransferProgressEvent {
     pub speed: f64,
 }
 
+/// Throttled emitter for `transfer-progress` events.
+///
+/// Emitting one event per 32 KiB chunk floods the Tauri IPC bridge with
+/// thousands of events per second, saturating the WebView main thread and
+/// freezing the whole UI (including the file browser). This wrapper caps
+/// emission at one event per `EMIT_INTERVAL`, plus a guaranteed final event
+/// via `finish()`.
+pub struct ProgressEmitter {
+    app_handle: tauri::AppHandle,
+    transfer_id: String,
+    total_bytes: u64,
+    start: std::time::Instant,
+    last_emit: Option<std::time::Instant>,
+}
+
+impl ProgressEmitter {
+    const EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Returns `None` when no app handle / transfer id was supplied,
+    /// i.e. progress reporting is disabled for this transfer.
+    pub fn new(
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+        total_bytes: u64,
+    ) -> Option<Self> {
+        match (app_handle, transfer_id) {
+            (Some(handle), Some(id)) => Some(Self {
+                app_handle: handle.clone(),
+                transfer_id: id.to_string(),
+                total_bytes,
+                start: std::time::Instant::now(),
+                last_emit: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Report progress; the event is dropped unless `EMIT_INTERVAL` has
+    /// elapsed since the previous emission.
+    pub fn report(&mut self, bytes_transferred: u64) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_emit {
+            if now.duration_since(last) < Self::EMIT_INTERVAL {
+                return;
+            }
+        }
+        self.last_emit = Some(now);
+        self.emit(bytes_transferred);
+    }
+
+    /// Always emits, regardless of throttling (final 100% event).
+    pub fn finish(&mut self, bytes_transferred: u64) {
+        self.last_emit = Some(std::time::Instant::now());
+        self.emit(bytes_transferred);
+    }
+
+    fn emit(&self, bytes_transferred: u64) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            bytes_transferred as f64 / elapsed
+        } else {
+            0.0
+        };
+        let progress = if self.total_bytes > 0 {
+            (bytes_transferred as f64 / self.total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = self.app_handle.emit(
+            "transfer-progress",
+            TransferProgressEvent {
+                transfer_id: self.transfer_id.clone(),
+                progress,
+                bytes_transferred,
+                total_bytes: self.total_bytes,
+                speed,
+            },
+        );
+    }
+}
+
 use crate::ssh::Client;
 
 /// Configuration for a standalone SFTP connection (SSH transport, no PTY).
@@ -292,8 +373,7 @@ impl StandaloneSftpClient {
         let mut buffer = Vec::new();
         let mut temp_buf = vec![0u8; 32768];
         let mut bytes_read = 0u64;
-        let start = std::time::Instant::now();
-        let should_emit = app_handle.is_some() && transfer_id.is_some();
+        let mut emitter = ProgressEmitter::new(app_handle, transfer_id, total_bytes);
 
         loop {
             let n = remote_file.read(&mut temp_buf).await?;
@@ -303,25 +383,13 @@ impl StandaloneSftpClient {
             buffer.extend_from_slice(&temp_buf[..n]);
             bytes_read += n as u64;
 
-            if should_emit && total_bytes > 0 {
-                let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    (bytes_read as f64) / elapsed
-                } else {
-                    0.0
-                };
-                let progress = (bytes_read as f64 / total_bytes as f64) * 100.0;
-                let _ = app_handle.unwrap().emit(
-                    "transfer-progress",
-                    TransferProgressEvent {
-                        transfer_id: transfer_id.unwrap().to_string(),
-                        progress,
-                        bytes_transferred: bytes_read,
-                        total_bytes,
-                        speed,
-                    },
-                );
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.report(bytes_read);
             }
+        }
+
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.finish(bytes_read);
         }
 
         tokio::fs::write(local_path, buffer).await?;
@@ -354,39 +422,22 @@ impl StandaloneSftpClient {
 
         let chunk_size: usize = 32768;
         let mut offset: usize = 0;
-        let start = std::time::Instant::now();
-        let should_emit = app_handle.is_some() && transfer_id.is_some();
+        let mut emitter = ProgressEmitter::new(app_handle, transfer_id, total_bytes);
 
         while offset < data.len() {
             let end = std::cmp::min(offset + chunk_size, data.len());
             remote_file.write_all(&data[offset..end]).await?;
             offset = end;
 
-            if should_emit {
-                let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    (offset as f64) / elapsed
-                } else {
-                    0.0
-                };
-                let progress = if total_bytes > 0 {
-                    (offset as f64 / total_bytes as f64) * 100.0
-                } else {
-                    100.0
-                };
-                let _ = app_handle.unwrap().emit(
-                    "transfer-progress",
-                    TransferProgressEvent {
-                        transfer_id: transfer_id.unwrap().to_string(),
-                        progress,
-                        bytes_transferred: offset as u64,
-                        total_bytes,
-                        speed,
-                    },
-                );
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.report(offset as u64);
             }
         }
         remote_file.flush().await?;
+
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.finish(offset as u64);
+        }
 
         Ok(total_bytes)
     }
