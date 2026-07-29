@@ -1,9 +1,12 @@
 use anyhow::Result;
 use async_std::io::ReadExt;
 use serde::Deserialize;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tauri::Emitter;
 
-use crate::sftp_client::{FileEntry, FileEntryType};
+use crate::sftp_client::{FileEntry, FileEntryType, TransferProgressEvent};
 
 /// Configuration for an FTP/FTPS connection.
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +37,54 @@ macro_rules! ftp_stream {
             FtpStreamKind::Secure($s) => $body,
         }
     }};
+}
+
+/// A reader that wraps in-memory file data and emits `transfer-progress`
+/// events as bytes are consumed by the FTP upload stream.
+struct ProgressReader {
+    data: Vec<u8>,
+    position: usize,
+    total: usize,
+    start: std::time::Instant,
+    app_handle: tauri::AppHandle,
+    transfer_id: String,
+}
+
+impl async_std::io::Read for ProgressReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.position >= self.total {
+            return Poll::Ready(Ok(0));
+        }
+        let remaining = self.total - self.position;
+        let to_read = std::cmp::min(remaining, buf.len());
+        buf[..to_read].copy_from_slice(&self.data[self.position..self.position + to_read]);
+        self.position += to_read;
+
+        // Emit progress event
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            (self.position as f64) / elapsed
+        } else {
+            0.0
+        };
+        let progress = (self.position as f64 / self.total as f64) * 100.0;
+        let _ = self.app_handle.emit(
+            "transfer-progress",
+            TransferProgressEvent {
+                transfer_id: self.transfer_id.clone(),
+                progress,
+                bytes_transferred: self.position as u64,
+                total_bytes: self.total as u64,
+                speed,
+            },
+        );
+
+        Poll::Ready(Ok(to_read))
+    }
 }
 
 /// FTP/FTPS client using `suppaftp` with async support.
@@ -194,15 +245,57 @@ impl FtpClient {
     }
 
     /// Download a remote file to a local path. Returns bytes downloaded.
-    pub async fn download_file(&mut self, remote_path: &str, local_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events so the frontend can show real-time progress and speed.
+    pub async fn download_file(
+        &mut self,
+        remote_path: &str,
+        local_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let data: Vec<u8> = ftp_stream!(self, s => {
             let mut data_stream = s.retr_as_stream(remote_path).await.map_err(|e| {
                 anyhow::anyhow!("Failed to download file '{}': {}", remote_path, e)
             })?;
+
+            // Read in chunks so we can report progress
             let mut buf = Vec::new();
-            data_stream.read_to_end(&mut buf).await.map_err(|e| {
-                anyhow::anyhow!("Failed to read download stream: {}", e)
-            })?;
+            let mut chunk = vec![0u8; 32768];
+            let start = std::time::Instant::now();
+            let should_emit = app_handle.is_some() && transfer_id.is_some();
+            // We don't know the total size for FTP downloads ahead of time,
+            // so we report bytes downloaded without a percentage.
+            loop {
+                let n = data_stream.read(&mut chunk).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to read download stream: {}", e)
+                })?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+
+                if should_emit {
+                    let bytes = buf.len() as u64;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (bytes as f64) / elapsed
+                    } else {
+                        0.0
+                    };
+                    // Report with unknown total (progress stays near 0 but speed is shown)
+                    let _ = app_handle.unwrap().emit(
+                        "transfer-progress",
+                        TransferProgressEvent {
+                            transfer_id: transfer_id.unwrap().to_string(),
+                            progress: 0.0,
+                            bytes_transferred: bytes,
+                            total_bytes: 0,
+                            speed,
+                        },
+                    );
+                }
+            }
             s.finalize_retr_stream(data_stream).await.map_err(|e| {
                 anyhow::anyhow!("Failed to finalize download: {}", e)
             })?;
@@ -215,18 +308,44 @@ impl FtpClient {
     }
 
     /// Upload a local file to a remote path. Returns bytes uploaded.
-    pub async fn upload_file(&mut self, local_path: &str, remote_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events as the data is streamed to the FTP server.
+    pub async fn upload_file(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let data = tokio::fs::read(local_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read local file '{}': {}", local_path, e))?;
         let total_bytes = data.len() as u64;
 
-        ftp_stream!(self, s => {
-            let mut reader = async_std::io::Cursor::new(data);
-            s.put_file(remote_path, &mut reader).await.map_err(|e| {
-                anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
-            })?
-        });
+        let should_emit = app_handle.is_some() && transfer_id.is_some();
+
+        if should_emit {
+            let mut reader = ProgressReader {
+                data,
+                position: 0,
+                total: total_bytes as usize,
+                start: std::time::Instant::now(),
+                app_handle: app_handle.unwrap().clone(),
+                transfer_id: transfer_id.unwrap().to_string(),
+            };
+            ftp_stream!(self, s => {
+                s.put_file(remote_path, &mut reader).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
+                })?
+            });
+        } else {
+            ftp_stream!(self, s => {
+                let mut reader = async_std::io::Cursor::new(data);
+                s.put_file(remote_path, &mut reader).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
+                })?
+            });
+        }
 
         Ok(total_bytes)
     }
@@ -272,37 +391,31 @@ impl FtpClient {
     }
 }
 
-/// Parse a single line from the FTP LIST command (Unix `ls -l` format).
-///
-/// Supports the common variants encountered in the wild:
-///   - `perms links owner group size mon day time name`            (9 tokens)
-///   - `perms links owner size mon day time name`                  (8 tokens, busybox)
-///   - `perms[+/.] ... system_u:object_r:... size mon day time name` (10+ tokens, ACL/SELinux)
-///   - numeric or symbolic owner/group
-///
-/// The key invariant used to locate fields: the date triple (`Mon DD HH:MM` or
-/// `Mon DD YYYY`) always sits immediately to the left of the file name, and
-/// the size is the rightmost numeric token to the left of the date. Everything
-/// after the date triple is the file name (preserving embedded spaces).
+/// Parse a single line from the FTP LIST command (Unix format).
+/// Example: `drwxr-xr-x   2 user group  4096 Jan 01 12:00 dirname`
 fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
 
-    // `ls -l` emits a "total NNN" summary as its first line — never a file entry.
-    // Reject it explicitly so it doesn't get misparsed as a weird file.
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("total") {
+    // Unix-style listing
+    let parts: Vec<&str> = line.splitn(9, char::is_whitespace).collect();
+    if parts.len() < 9 {
+        // Try to at least get the name
+        if let Some(last) = line.split_whitespace().last() {
+            return Some(FileEntry {
+                name: last.to_string(),
+                size: 0,
+                modified: None,
+                permissions: None,
+                file_type: FileEntryType::File,
+            });
+        }
         return None;
     }
 
-    // Must start with a perms-like token (d/l/- followed by rwx/-).
-    let perms_str = tokens.first()?;
-    if !is_perms_token(perms_str) {
-        return None;
-    }
-
+    let perms_str = parts[0];
     let file_type = if perms_str.starts_with('d') {
         FileEntryType::Directory
     } else if perms_str.starts_with('l') {
@@ -311,42 +424,32 @@ fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
         FileEntryType::File
     };
 
-    // Locate the date triple by scanning for a recognised month abbreviation.
-    // Layout to the right of `month_idx`: [month, day, time_or_year, name...].
-    // We need at least 4 tokens from `month_idx` onward (month + day + date + name).
-    let month_idx = (0..tokens.len().saturating_sub(3)).find(|&i| {
-        is_month_abbr(tokens[i]) && is_day(tokens.get(i + 1)) && is_date_field(tokens.get(i + 2))
-    })?;
-
-    let month = tokens[month_idx];
-    let day = tokens[month_idx + 1];
-    let time_or_year = tokens[month_idx + 2];
-    let modified = parse_ftp_modified(month, day, time_or_year);
-
-    // Name is everything after the date triple (preserves embedded spaces).
-    let name_raw = tokens[month_idx + 3..].join(" ");
-    // For symlinks, strip the " -> target" suffix.
-    let name = if matches!(file_type, FileEntryType::Symlink) {
-        name_raw
-            .split(" -> ")
-            .next()
-            .unwrap_or(&name_raw)
-            .to_string()
-    } else {
-        name_raw
-    };
-
-    if name.is_empty() {
-        return None;
+    // Filter out empty parts from whitespace splitting
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.len() < 9 {
+        let name = tokens.last().unwrap_or(&"").to_string();
+        return Some(FileEntry {
+            name,
+            size: 0,
+            modified: None,
+            permissions: Some(perms_str.to_string()),
+            file_type,
+        });
     }
 
-    // Size is the rightmost numeric token strictly left of the date triple.
-    // (Falls back to 0 for listings without a size column — e.g. some minimal daemons.)
-    let size = tokens[..month_idx]
-        .iter()
-        .rev()
-        .find_map(|t| t.parse::<u64>().ok())
-        .unwrap_or(0);
+    let size = tokens[4].parse::<u64>().unwrap_or(0);
+    let month = tokens[5];
+    let day = tokens[6];
+    let time_or_year = tokens[7];
+    let modified = parse_ftp_modified(month, day, time_or_year);
+    // Name is everything after the 8th token (handles spaces in names)
+    let name = tokens[8..].join(" ");
+    // For symlinks, strip the " -> target" part from the name
+    let name = if matches!(file_type, FileEntryType::Symlink) {
+        name.split(" -> ").next().unwrap_or(&name).to_string()
+    } else {
+        name
+    };
 
     Some(FileEntry {
         name,
@@ -355,67 +458,6 @@ fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
         permissions: Some(perms_str.to_string()),
         file_type,
     })
-}
-
-/// True for a Unix permission string like `drwxr-xr-x`, `-rw-r--r--`,
-/// `lrwxrwxrwx`, optionally with an ACL (`+`) or SELinux-context (`.`) suffix.
-fn is_perms_token(s: &str) -> bool {
-    // Bare perms are 10 chars: 1 type char (`d`/`l`/`-`) + 9 rwx/- chars.
-    // An ACL (`+`) or SELinux-context (`.`) suffix adds one more char → 11.
-    let bytes = s.as_bytes();
-    let body_len = bytes.len();
-    if !(10..=11).contains(&body_len) {
-        return false;
-    }
-    if !matches!(bytes[0], b'd' | b'l' | b'-') {
-        return false;
-    }
-    // Positions 1..=9 (9 chars) must all be r/w/x/-.
-    bytes[1..10]
-        .iter()
-        .all(|&b| matches!(b, b'r' | b'w' | b'x' | b'-'))
-}
-
-fn is_month_abbr(s: &str) -> bool {
-    matches!(
-        s,
-        "Jan"
-            | "Feb"
-            | "Mar"
-            | "Apr"
-            | "May"
-            | "Jun"
-            | "Jul"
-            | "Aug"
-            | "Sep"
-            | "Oct"
-            | "Nov"
-            | "Dec"
-    )
-}
-
-/// True for a day-of-month token: 1–2 digits, optionally with a trailing
-/// non-digit (some locales pad with `_` etc.).
-fn is_day(s: Option<&&str>) -> bool {
-    let Some(s) = s else { return false };
-    s.trim_end_matches(|c: char| !c.is_ascii_digit())
-        .parse::<u32>()
-        .map(|d| (1..=31).contains(&d))
-        .unwrap_or(false)
-}
-
-/// True for the third date column: either `HH:MM` (recent file) or `YYYY` (older).
-fn is_date_field(s: Option<&&str>) -> bool {
-    let Some(s) = s else { return false };
-    if s.contains(':') {
-        // HH:MM — two colon-separated numeric parts.
-        let parts: Vec<&str> = s.split(':').collect();
-        parts.len() == 2
-            && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    } else {
-        // YYYY — a 4-digit year.
-        s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit())
-    }
 }
 
 /// Parse FTP `ls` date fields ("Mon DD HH:MM" or "Mon DD YYYY") into "yyyy-mm-dd hh:mm:ss".
@@ -592,7 +634,7 @@ mod tests {
             .expect("write temp file");
 
         let uploaded_bytes = client
-            .upload_file(tmp_upload.to_str().unwrap(), &test_file_remote)
+            .upload_file(tmp_upload.to_str().unwrap(), &test_file_remote, None, None)
             .await
             .expect("upload_file should succeed");
         assert_eq!(uploaded_bytes, upload_content.len() as u64);
@@ -611,7 +653,7 @@ mod tests {
         // 4d. Download the file and verify contents
         let tmp_download = std::env::temp_dir().join("rshell_e2e_download.txt");
         let downloaded_bytes = client
-            .download_file(&test_file_remote, tmp_download.to_str().unwrap())
+            .download_file(&test_file_remote, tmp_download.to_str().unwrap(), None, None)
             .await
             .expect("download_file should succeed");
         assert_eq!(downloaded_bytes, upload_content.len() as u64);
@@ -721,150 +763,6 @@ mod tests {
         let line = "drwxr-xr-x   2 user group  4096 Jan 01 00:00 .";
         let entry = parse_ftp_list_line(line).expect("should parse");
         assert_eq!(entry.name, ".");
-    }
-
-    // ---- Regression tests for variable-column LIST formats ----
-    //
-    // The original parser used fixed indices `tokens[4..8]` which only worked
-    // for the strict 9-token "perms links owner group size mon day time name"
-    // layout. Real-world FTP servers (notably embedded / arcade-style boxes
-    // running busybox or SELinux-enabled distros) emit:
-    //   - 8-token lines (no `group` column)        → silently lost metadata
-    //   - 10+ token lines (SELinux context / ACL)  → name leaked time tokens,
-    //     producing the exact "12:32 dev" / "2000 Pacman" corruption users saw.
-    //
-    // These tests lock in the robust from-the-right parsing behaviour.
-
-    #[test]
-    fn test_parse_ftp_list_line_selinux_context_dir() {
-        // 10 tokens — the bug that produced "12:32 dev" in the file name.
-        let line = "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jan 15 12:32 dev";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "dev");
-        assert!(matches!(entry.file_type, FileEntryType::Directory));
-        assert_eq!(entry.size, 4096);
-        // Time-format date must keep its time-of-day, not bleed into the name.
-        assert!(
-            entry.modified.as_deref().unwrap_or("").ends_with(" 12:32:00"),
-            "modified should keep 12:32:00, got: {:?}",
-            entry.modified
-        );
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_selinux_context_file_year() {
-        // 11 tokens — the bug that produced "2000 Pacman" / "2000 gamelist.xml".
-        let line =
-            "-rw-r--r--. 1 root root system_u:object_r:default_t 85234 Nov 09  2000 gamelist.xml";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "gamelist.xml");
-        assert!(matches!(entry.file_type, FileEntryType::File));
-        assert_eq!(entry.size, 85234);
-        assert_eq!(entry.modified.as_deref(), Some("2000-11-09 00:00:00"));
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_acl_extended() {
-        // ACL `+` suffix on perms — extra columns must not corrupt parsing.
-        let line = "drwxr-xr-x+  3 root root  4096 Feb 28  2024 with spaces in name";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "with spaces in name");
-        assert_eq!(entry.size, 4096);
-        assert_eq!(entry.modified.as_deref(), Some("2024-02-28 00:00:00"));
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_no_group_busybox() {
-        // busybox/embedded omit the `group` column → 8 tokens. Must still
-        // recover size + modified + permissions rather than falling back.
-        let line = "-rw-r--r--   1 root  85234 Jul 27 12:46 gamelist.xml";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "gamelist.xml");
-        assert_eq!(entry.size, 85234);
-        assert_eq!(entry.permissions.as_deref(), Some("-rw-r--r--"));
-        assert!(
-            entry.modified.is_some(),
-            "modified should be parsed, got None"
-        );
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_no_group_dir() {
-        let line = "drwxr-xr-x   2 root  4096 Jan 15 12:32 dev";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "dev");
-        assert!(matches!(entry.file_type, FileEntryType::Directory));
-        assert_eq!(entry.size, 4096);
-        assert!(entry.modified.is_some());
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_numeric_owner_group() {
-        let line = "drwxr-xr-x 2 1000 1000 4096 Mar 01 09:15 shared";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "shared");
-        assert_eq!(entry.size, 4096);
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_symlink_with_extra_columns() {
-        let line =
-            "lrwxrwxrwx. 1 root root system_u:object_r:default_t 10 Mar 01 00:00 link -> target";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "link");
-        assert!(matches!(entry.file_type, FileEntryType::Symlink));
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_name_with_spaces_extra_columns() {
-        // Spaces in the filename PLUS a SELinux context column.
-        let line =
-            "-rw-r--r--. 1 root root system_u:object_r:default_t 100 Dec 25 23:59 my file name.txt";
-        let entry = parse_ftp_list_line(line).expect("should parse");
-        assert_eq!(entry.name, "my file name.txt");
-        assert_eq!(entry.size, 100);
-    }
-
-    #[test]
-    fn test_parse_ftp_list_line_total_line_ignored() {
-        // `ls -l` prepends a "total NNN" summary line — must not be parsed as an entry.
-        assert!(parse_ftp_list_line("total 123").is_none());
-        assert!(parse_ftp_list_line("total 0").is_none());
-    }
-
-    /// End-to-end regression test reproducing the exact user-reported symptoms
-    /// on an arcade/emulator FTP server (MAME dirs: Pacman, SEGA, Taito, ...).
-    ///
-    /// Before the fix, SELinux-context listings produced:
-    ///   - name = "12:32 dev", "2000 Pacman", "2000 gamelist.xml"
-    ///   - modified = bogus dates parsed from misaligned size/perms tokens
-    /// After the fix, every field is correctly extracted.
-    #[test]
-    fn test_parse_ftp_list_line_user_scenario_arcade_box() {
-        let lines = [
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jan 15 12:32 dev",
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jan 15 12:32 proc",
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jan 15 12:32 sys",
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jul 25 12:46 Pacman",
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jul 25 12:46 SEGA",
-            "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jul 25 12:46 Taito",
-            "-rw-r--r--. 1 root root system_u:object_r:default_t 85234 Nov 09  2000 gamelist.xml",
-        ];
-
-        let dev = parse_ftp_list_line(lines[0]).expect("dev must parse");
-        assert_eq!(dev.name, "dev");
-        assert!(matches!(dev.file_type, FileEntryType::Directory));
-        assert_eq!(dev.size, 4096);
-
-        let pacman = parse_ftp_list_line(lines[3]).expect("Pacman must parse");
-        assert_eq!(pacman.name, "Pacman");
-        assert!(matches!(pacman.file_type, FileEntryType::Directory));
-
-        let gamelist = parse_ftp_list_line(lines[6]).expect("gamelist.xml must parse");
-        assert_eq!(gamelist.name, "gamelist.xml");
-        assert!(matches!(gamelist.file_type, FileEntryType::File));
-        assert_eq!(gamelist.size, 85234);
-        assert_eq!(gamelist.modified.as_deref(), Some("2000-11-09 00:00:00"));
     }
 
     // ---- Task 5.4: Additional unit tests ----

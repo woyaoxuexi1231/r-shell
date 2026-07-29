@@ -183,19 +183,19 @@ export function TransferQueue({
 
                   {item.status === "transferring" && (
                     <>
-                      <div className="w-20 h-1.5 bg-muted rounded-full overflow-hidden">
+                      <div className="w-20 h-1.5 bg-muted rounded-full overflow-hidden shrink-0">
                         <div
                           className="h-full bg-primary rounded-full transition-all duration-300"
-                          style={{ width: `${item.progress}%` }}
+                          style={{ width: `${Math.min(100, Math.max(0, item.progress))}%` }}
                         />
                       </div>
-                      <span className="text-muted-foreground w-10 text-right">
-                        {item.progress}%
+                      <span className="text-muted-foreground w-10 shrink-0 text-right whitespace-nowrap tabular-nums">
+                        {Math.round(item.progress)}%
                       </span>
-                      <span className="text-muted-foreground w-16 text-right">
+                      <span className="text-muted-foreground w-16 shrink-0 text-right whitespace-nowrap tabular-nums">
                         {formatSpeed(item.speed)}
                       </span>
-                      <span className="text-muted-foreground w-10 text-right">
+                      <span className="text-muted-foreground w-12 shrink-0 text-right whitespace-nowrap tabular-nums">
                         {formatEta(item)}
                       </span>
                     </>

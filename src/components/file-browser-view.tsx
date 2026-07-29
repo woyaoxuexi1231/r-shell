@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useReducer, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from 'react-i18next';
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -22,9 +22,14 @@ import { TransferQueue } from "./transfer-queue";
 import type { FileEntry } from "@/lib/file-entry-types";
 import { pathJoin } from "@/lib/file-entry-types";
 import {
-  transferQueueReducer,
   getNextQueuedTransfer,
 } from "@/lib/transfer-queue-reducer";
+import {
+  useTransferQueue,
+  ensureTransferProgressListener,
+  tryBeginProcessing,
+  endProcessing,
+} from "@/lib/transfer-store";
 import {
   buildMixedDropUploadPlan,
   type DroppedPathStat,
@@ -55,7 +60,9 @@ export function FileBrowserView({
 }: FileBrowserViewProps) {
   const { t } = useTranslation();
   const [activePanel, setActivePanel] = useState<"local" | "remote">("local");
-  const [transfers, dispatchTransfer] = useReducer(transferQueueReducer, []);
+  // Transfers live in a module-level store so records survive unmounts
+  // (hidden panels, zen mode, layout switches).
+  const [transfers, dispatchTransfer] = useTransferQueue(connectionId);
   const [queueExpanded, setQueueExpanded] = useState(false);
   const [syncDialogOpen, setSyncDialogOpen] = useState(false);
   const [dirTransfer, setDirTransfer] = useState<{
@@ -152,13 +159,17 @@ export function FileBrowserView({
   );
 
   // ------ Transfer execution ------
-  const processTransferRef = useRef(false);
+
+  // Register the global transfer-progress listener (kept alive for the app
+  // lifetime, so progress is recorded even while this component is unmounted).
+  useEffect(() => {
+    ensureTransferProgressListener();
+  }, []);
 
   useEffect(() => {
     const nextItem = getNextQueuedTransfer(transfers);
-    if (!nextItem || processTransferRef.current) return;
+    if (!nextItem || !tryBeginProcessing(connectionId)) return;
 
-    processTransferRef.current = true;
     dispatchTransfer({ type: "START", id: nextItem.id });
 
     const doTransfer = async () => {
@@ -170,6 +181,7 @@ export function FileBrowserView({
               connectionId,
               localPath: nextItem.sourcePath,
               remotePath: nextItem.destinationPath,
+              transferId: nextItem.id,
             },
           );
           if (result.success) {
@@ -189,6 +201,7 @@ export function FileBrowserView({
               connectionId,
               remotePath: nextItem.sourcePath,
               localPath: nextItem.destinationPath,
+              transferId: nextItem.id,
             },
           );
           if (result.success) {
@@ -223,7 +236,7 @@ export function FileBrowserView({
           error: err instanceof Error ? err.message : String(err),
         });
       } finally {
-        processTransferRef.current = false;
+        endProcessing(connectionId);
       }
     };
 

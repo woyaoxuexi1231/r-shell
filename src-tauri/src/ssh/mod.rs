@@ -5,9 +5,12 @@ use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::sftp_client::TransferProgressEvent;
 
 /// Preferred host-key algorithms advertised to the server, ordered from most to
 /// least preferred.  RSA variants (including the legacy `ssh-rsa` / SHA-1) are
@@ -378,7 +381,13 @@ impl SshClient {
         }
     }
 
-    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
+    pub async fn download_file(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         if let Some(session) = &self.session {
             // Open SFTP subsystem
             let channel = session.channel_open_session().await?;
@@ -388,10 +397,16 @@ impl SshClient {
             // Open remote file for reading
             let mut remote_file = sftp.open(remote_path).await?;
 
+            // Get file metadata for total size
+            let metadata = remote_file.metadata().await?;
+            let total_bytes = metadata.size.unwrap_or(0);
+
             // Read file content
             let mut buffer = Vec::new();
-            let mut temp_buf = vec![0u8; 8192];
-            let mut total_bytes = 0u64;
+            let mut temp_buf = vec![0u8; 32768];
+            let mut bytes_read = 0u64;
+            let start = std::time::Instant::now();
+            let should_emit = app_handle.is_some() && transfer_id.is_some();
 
             loop {
                 let n = remote_file.read(&mut temp_buf).await?;
@@ -399,19 +414,44 @@ impl SshClient {
                     break;
                 }
                 buffer.extend_from_slice(&temp_buf[..n]);
-                total_bytes += n as u64;
+                bytes_read += n as u64;
+
+                if should_emit && total_bytes > 0 {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (bytes_read as f64) / elapsed
+                    } else {
+                        0.0
+                    };
+                    let progress = (bytes_read as f64 / total_bytes as f64) * 100.0;
+                    let _ = app_handle.unwrap().emit(
+                        "transfer-progress",
+                        TransferProgressEvent {
+                            transfer_id: transfer_id.unwrap().to_string(),
+                            progress,
+                            bytes_transferred: bytes_read,
+                            total_bytes,
+                            speed,
+                        },
+                    );
+                }
             }
 
             // Write to local file
             tokio::fs::write(local_path, buffer).await?;
 
-            Ok(total_bytes)
+            Ok(bytes_read)
         } else {
             Err(anyhow::anyhow!("Not connected"))
         }
     }
 
-    pub async fn download_file_to_memory(&self, remote_path: &str) -> Result<Vec<u8>> {
+    pub async fn download_file_to_memory(
+        &self,
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
         if let Some(session) = &self.session {
             // Open SFTP subsystem
             let channel = session.channel_open_session().await?;
@@ -421,9 +461,15 @@ impl SshClient {
             // Open remote file for reading
             let mut remote_file = sftp.open(remote_path).await?;
 
+            // Get file metadata for total size
+            let metadata = remote_file.metadata().await?;
+            let total_bytes = metadata.size.unwrap_or(0);
+
             // Read file content
             let mut buffer = Vec::new();
-            let mut temp_buf = vec![0u8; 8192];
+            let mut temp_buf = vec![0u8; 32768];
+            let start = std::time::Instant::now();
+            let should_emit = app_handle.is_some() && transfer_id.is_some();
 
             loop {
                 let n = remote_file.read(&mut temp_buf).await?;
@@ -431,6 +477,27 @@ impl SshClient {
                     break;
                 }
                 buffer.extend_from_slice(&temp_buf[..n]);
+
+                if should_emit && total_bytes > 0 {
+                    let bytes_read = buffer.len() as u64;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (bytes_read as f64) / elapsed
+                    } else {
+                        0.0
+                    };
+                    let progress = (bytes_read as f64 / total_bytes as f64) * 100.0;
+                    let _ = app_handle.unwrap().emit(
+                        "transfer-progress",
+                        TransferProgressEvent {
+                            transfer_id: transfer_id.unwrap().to_string(),
+                            progress,
+                            bytes_transferred: bytes_read,
+                            total_bytes,
+                            speed,
+                        },
+                    );
+                }
             }
 
             Ok(buffer)
@@ -439,7 +506,13 @@ impl SshClient {
         }
     }
 
-    pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
+    pub async fn upload_file(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         if let Some(session) = &self.session {
             // Read local file
             let data = tokio::fs::read(local_path).await?;
@@ -454,13 +527,35 @@ impl SshClient {
             let mut remote_file = sftp.create(remote_path).await?;
 
             // Write data in chunks
-            let mut offset = 0;
-            let chunk_size = 8192;
+            let mut offset: usize = 0;
+            let chunk_size: usize = 32768;
+            let start = std::time::Instant::now();
+            let should_emit = app_handle.is_some() && transfer_id.is_some();
 
             while offset < data.len() {
                 let end = std::cmp::min(offset + chunk_size, data.len());
                 remote_file.write_all(&data[offset..end]).await?;
                 offset = end;
+
+                if should_emit {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (offset as f64) / elapsed
+                    } else {
+                        0.0
+                    };
+                    let progress = (offset as f64 / total_bytes as f64) * 100.0;
+                    let _ = app_handle.unwrap().emit(
+                        "transfer-progress",
+                        TransferProgressEvent {
+                            transfer_id: transfer_id.unwrap().to_string(),
+                            progress,
+                            bytes_transferred: offset as u64,
+                            total_bytes,
+                            speed,
+                        },
+                    );
+                }
             }
 
             remote_file.flush().await?;
@@ -471,7 +566,13 @@ impl SshClient {
         }
     }
 
-    pub async fn upload_file_from_bytes(&self, data: &[u8], remote_path: &str) -> Result<u64> {
+    pub async fn upload_file_from_bytes(
+        &self,
+        data: &[u8],
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         if let Some(session) = &self.session {
             let total_bytes = data.len() as u64;
 
@@ -484,13 +585,35 @@ impl SshClient {
             let mut remote_file = sftp.create(remote_path).await?;
 
             // Write data in chunks
-            let mut offset = 0;
-            let chunk_size = 8192;
+            let mut offset: usize = 0;
+            let chunk_size: usize = 32768;
+            let start = std::time::Instant::now();
+            let should_emit = app_handle.is_some() && transfer_id.is_some();
 
             while offset < data.len() {
                 let end = std::cmp::min(offset + chunk_size, data.len());
                 remote_file.write_all(&data[offset..end]).await?;
                 offset = end;
+
+                if should_emit {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (offset as f64) / elapsed
+                    } else {
+                        0.0
+                    };
+                    let progress = (offset as f64 / total_bytes as f64) * 100.0;
+                    let _ = app_handle.unwrap().emit(
+                        "transfer-progress",
+                        TransferProgressEvent {
+                            transfer_id: transfer_id.unwrap().to_string(),
+                            progress,
+                            bytes_transferred: offset as u64,
+                            total_bytes,
+                            speed,
+                        },
+                    );
+                }
             }
 
             remote_file.flush().await?;
