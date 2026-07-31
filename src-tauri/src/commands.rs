@@ -389,7 +389,7 @@ pub async fn sftp_download_file(
 
     // If local_path is empty, download to memory (for browser download)
     if request.local_path.is_empty() {
-        match client.download_file_to_memory(&request.remote_path).await {
+        match client.download_file_to_memory(&request.remote_path, None, None).await {
             Ok(data) => {
                 let bytes = data.len() as u64;
                 Ok(FileTransferResponse {
@@ -409,7 +409,7 @@ pub async fn sftp_download_file(
     } else {
         // Download to local file
         match client
-            .download_file(&request.remote_path, &request.local_path)
+            .download_file(&request.remote_path, &request.local_path, None, None)
             .await
         {
             Ok(bytes) => Ok(FileTransferResponse {
@@ -444,11 +444,11 @@ pub async fn sftp_upload_file(
     // If data is provided, write directly; otherwise read from local_path
     let result = if let Some(data) = &request.data {
         client
-            .upload_file_from_bytes(data, &request.remote_path)
+            .upload_file_from_bytes(data, &request.remote_path, None, None)
             .await
     } else {
         client
-            .upload_file(&request.local_path, &request.remote_path)
+            .upload_file(&request.local_path, &request.remote_path, None, None)
             .await
     };
 
@@ -559,7 +559,7 @@ pub async fn create_file(
 
     // Upload the content as bytes
     match client
-        .upload_file_from_bytes(content.as_bytes(), &path)
+        .upload_file_from_bytes(content.as_bytes(), &path, None, None)
         .await
     {
         Ok(_) => Ok(true),
@@ -2283,12 +2283,15 @@ pub async fn list_remote_files(
 
 #[tauri::command]
 pub async fn download_remote_file(
+    app_handle: tauri::AppHandle,
     connection_id: String,
     remote_path: String,
     local_path: String,
+    transfer_id: Option<String>,
     state: State<'_, Arc<ConnectionManager>>,
 ) -> Result<FileTransferResponse, String> {
     let conn_type = state.get_connection_type(&connection_id).await;
+    let tid = transfer_id.as_deref();
 
     let result = match conn_type.as_deref() {
         Some("SFTP") => {
@@ -2297,7 +2300,7 @@ pub async fn download_remote_file(
             let client = connections
                 .get(&connection_id)
                 .ok_or("SFTP connection not found".to_string())?;
-            client.download_file(&remote_path, &local_path).await
+            client.download_file(&remote_path, &local_path, Some(&app_handle), tid).await
         }
         Some("FTP") => {
             let ftp_map = state.get_ftp_connection().await;
@@ -2305,18 +2308,17 @@ pub async fn download_remote_file(
             let client = connections
                 .get_mut(&connection_id)
                 .ok_or("FTP connection not found".to_string())?;
-            client.download_file(&remote_path, &local_path).await
+            client.download_file(&remote_path, &local_path, Some(&app_handle), tid).await
         }
         Some(other) => return Err(format!("Unsupported protocol: {}", other)),
         None => {
-            // Fallback: try SSH connection (integrated file browser uses SSH connections
-            // which are not registered in connection_types)
+            // Fallback: try SSH connection
             let connection = state
                 .get_connection(&connection_id)
                 .await
                 .ok_or_else(|| format!("No connection found for '{}'", connection_id))?;
             let client = connection.read().await;
-            client.download_file(&remote_path, &local_path).await
+            client.download_file(&remote_path, &local_path, Some(&app_handle), tid).await
         }
     };
 
@@ -2338,12 +2340,15 @@ pub async fn download_remote_file(
 
 #[tauri::command]
 pub async fn upload_remote_file(
+    app_handle: tauri::AppHandle,
     connection_id: String,
     local_path: String,
     remote_path: String,
+    transfer_id: Option<String>,
     state: State<'_, Arc<ConnectionManager>>,
 ) -> Result<FileTransferResponse, String> {
     let conn_type = state.get_connection_type(&connection_id).await;
+    let tid = transfer_id.as_deref();
 
     let result = match conn_type.as_deref() {
         Some("SFTP") => {
@@ -2352,7 +2357,7 @@ pub async fn upload_remote_file(
             let client = connections
                 .get(&connection_id)
                 .ok_or("SFTP connection not found".to_string())?;
-            client.upload_file(&local_path, &remote_path).await
+            client.upload_file(&local_path, &remote_path, Some(&app_handle), tid).await
         }
         Some("FTP") => {
             let ftp_map = state.get_ftp_connection().await;
@@ -2360,18 +2365,17 @@ pub async fn upload_remote_file(
             let client = connections
                 .get_mut(&connection_id)
                 .ok_or("FTP connection not found".to_string())?;
-            client.upload_file(&local_path, &remote_path).await
+            client.upload_file(&local_path, &remote_path, Some(&app_handle), tid).await
         }
         Some(other) => return Err(format!("Unsupported protocol: {}", other)),
         None => {
-            // Fallback: try SSH connection (integrated file browser uses SSH connections
-            // which are not registered in connection_types)
+            // Fallback: try SSH connection
             let connection = state
                 .get_connection(&connection_id)
                 .await
                 .ok_or_else(|| format!("No connection found for '{}'", connection_id))?;
             let client = connection.read().await;
-            client.upload_file(&local_path, &remote_path).await
+            client.upload_file(&local_path, &remote_path, Some(&app_handle), tid).await
         }
     };
 

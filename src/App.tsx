@@ -706,7 +706,12 @@ function AppContent() {
   }, [state.groups, dispatch]);
 
   const handleNewTab = useCallback((folderPath?: string) => {
-    setConnectionInitialFolder(folderPath);
+    // Guard: this handler is also bound directly as onClick={...} in several
+    // places, where React passes the click event as the first argument. Only
+    // accept real strings — otherwise the event object (containing DOM nodes)
+    // would end up in the saved connection's `folder` field and crash
+    // JSON.stringify with a circular structure error on connect.
+    setConnectionInitialFolder(typeof folderPath === 'string' ? folderPath : undefined);
     setConnectionDialogOpen(true);
     setEditingConnection(null);
     setPendingConnectionId(null);

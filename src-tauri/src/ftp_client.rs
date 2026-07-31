@@ -1,9 +1,11 @@
 use anyhow::Result;
 use async_std::io::ReadExt;
 use serde::Deserialize;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::sftp_client::{FileEntry, FileEntryType};
+use crate::sftp_client::{FileEntry, FileEntryType, ProgressEmitter};
 
 /// Configuration for an FTP/FTPS connection.
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +36,42 @@ macro_rules! ftp_stream {
             FtpStreamKind::Secure($s) => $body,
         }
     }};
+}
+
+/// A reader that wraps in-memory file data and emits throttled
+/// `transfer-progress` events as bytes are consumed by the FTP upload stream.
+struct ProgressReader {
+    data: Vec<u8>,
+    position: usize,
+    total: usize,
+    emitter: ProgressEmitter,
+}
+
+impl async_std::io::Read for ProgressReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.position >= self.total {
+            return Poll::Ready(Ok(0));
+        }
+        let remaining = self.total - self.position;
+        let to_read = std::cmp::min(remaining, buf.len());
+        buf[..to_read].copy_from_slice(&self.data[self.position..self.position + to_read]);
+        self.position += to_read;
+
+        // Throttled progress event; always emit the final one so the UI
+        // reaches 100%.
+        let position = self.position as u64;
+        if self.position >= self.total {
+            self.emitter.finish(position);
+        } else {
+            self.emitter.report(position);
+        }
+
+        Poll::Ready(Ok(to_read))
+    }
 }
 
 /// FTP/FTPS client using `suppaftp` with async support.
@@ -194,15 +232,42 @@ impl FtpClient {
     }
 
     /// Download a remote file to a local path. Returns bytes downloaded.
-    pub async fn download_file(&mut self, remote_path: &str, local_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events so the frontend can show real-time progress and speed.
+    pub async fn download_file(
+        &mut self,
+        remote_path: &str,
+        local_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let data: Vec<u8> = ftp_stream!(self, s => {
             let mut data_stream = s.retr_as_stream(remote_path).await.map_err(|e| {
                 anyhow::anyhow!("Failed to download file '{}': {}", remote_path, e)
             })?;
+
+            // Read in chunks so we can report progress. We don't know the
+            // total size for FTP downloads ahead of time, so progress stays
+            // at 0% but bytes transferred and speed are shown.
             let mut buf = Vec::new();
-            data_stream.read_to_end(&mut buf).await.map_err(|e| {
-                anyhow::anyhow!("Failed to read download stream: {}", e)
-            })?;
+            let mut chunk = vec![0u8; 32768];
+            let mut emitter = ProgressEmitter::new(app_handle, transfer_id, 0);
+            loop {
+                let n = data_stream.read(&mut chunk).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to read download stream: {}", e)
+                })?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+
+                if let Some(emitter) = emitter.as_mut() {
+                    emitter.report(buf.len() as u64);
+                }
+            }
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.finish(buf.len() as u64);
+            }
             s.finalize_retr_stream(data_stream).await.map_err(|e| {
                 anyhow::anyhow!("Failed to finalize download: {}", e)
             })?;
@@ -215,18 +280,40 @@ impl FtpClient {
     }
 
     /// Upload a local file to a remote path. Returns bytes uploaded.
-    pub async fn upload_file(&mut self, local_path: &str, remote_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events as the data is streamed to the FTP server.
+    pub async fn upload_file(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let data = tokio::fs::read(local_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read local file '{}': {}", local_path, e))?;
         let total_bytes = data.len() as u64;
 
-        ftp_stream!(self, s => {
-            let mut reader = async_std::io::Cursor::new(data);
-            s.put_file(remote_path, &mut reader).await.map_err(|e| {
-                anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
-            })?
-        });
+        if let Some(emitter) = ProgressEmitter::new(app_handle, transfer_id, total_bytes) {
+            let mut reader = ProgressReader {
+                data,
+                position: 0,
+                total: total_bytes as usize,
+                emitter,
+            };
+            ftp_stream!(self, s => {
+                s.put_file(remote_path, &mut reader).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
+                })?
+            });
+        } else {
+            ftp_stream!(self, s => {
+                let mut reader = async_std::io::Cursor::new(data);
+                s.put_file(remote_path, &mut reader).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to upload file '{}': {}", remote_path, e)
+                })?
+            });
+        }
 
         Ok(total_bytes)
     }
@@ -284,13 +371,18 @@ impl FtpClient {
 /// `Mon DD YYYY`) always sits immediately to the left of the file name, and
 /// the size is the rightmost numeric token to the left of the date. Everything
 /// after the date triple is the file name (preserving embedded spaces).
+///
+/// A naive fixed-index parser (`tokens[4]` == size, `tokens[5..8]` == date)
+/// only works for the strict 9-token layout and corrupts SELinux/ACL/busybox
+/// listings (e.g. names like "12:32 dev" / "2000 Pacman"). Keep the
+/// from-the-right scan below and the regression tests that lock it in.
 fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
 
-    // `ls -l` emits a "total NNN" summary as its first line — never a file entry.
+    // `ls -l` emits a "total NNN" summary as its first line -- never a file entry.
     // Reject it explicitly so it doesn't get misparsed as a weird file.
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("total") {
@@ -341,7 +433,7 @@ fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
     }
 
     // Size is the rightmost numeric token strictly left of the date triple.
-    // (Falls back to 0 for listings without a size column — e.g. some minimal daemons.)
+    // (Falls back to 0 for listings without a size column -- e.g. some minimal daemons.)
     let size = tokens[..month_idx]
         .iter()
         .rev()
@@ -361,7 +453,7 @@ fn parse_ftp_list_line(line: &str) -> Option<FileEntry> {
 /// `lrwxrwxrwx`, optionally with an ACL (`+`) or SELinux-context (`.`) suffix.
 fn is_perms_token(s: &str) -> bool {
     // Bare perms are 10 chars: 1 type char (`d`/`l`/`-`) + 9 rwx/- chars.
-    // An ACL (`+`) or SELinux-context (`.`) suffix adds one more char → 11.
+    // An ACL (`+`) or SELinux-context (`.`) suffix adds one more char -> 11.
     let bytes = s.as_bytes();
     let body_len = bytes.len();
     if !(10..=11).contains(&body_len) {
@@ -394,7 +486,7 @@ fn is_month_abbr(s: &str) -> bool {
     )
 }
 
-/// True for a day-of-month token: 1–2 digits, optionally with a trailing
+/// True for a day-of-month token: 1-2 digits, optionally with a trailing
 /// non-digit (some locales pad with `_` etc.).
 fn is_day(s: Option<&&str>) -> bool {
     let Some(s) = s else { return false };
@@ -408,12 +500,12 @@ fn is_day(s: Option<&&str>) -> bool {
 fn is_date_field(s: Option<&&str>) -> bool {
     let Some(s) = s else { return false };
     if s.contains(':') {
-        // HH:MM — two colon-separated numeric parts.
+        // HH:MM -- two colon-separated numeric parts.
         let parts: Vec<&str> = s.split(':').collect();
         parts.len() == 2
             && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     } else {
-        // YYYY — a 4-digit year.
+        // YYYY -- a 4-digit year.
         s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit())
     }
 }
@@ -592,7 +684,7 @@ mod tests {
             .expect("write temp file");
 
         let uploaded_bytes = client
-            .upload_file(tmp_upload.to_str().unwrap(), &test_file_remote)
+            .upload_file(tmp_upload.to_str().unwrap(), &test_file_remote, None, None)
             .await
             .expect("upload_file should succeed");
         assert_eq!(uploaded_bytes, upload_content.len() as u64);
@@ -611,7 +703,7 @@ mod tests {
         // 4d. Download the file and verify contents
         let tmp_download = std::env::temp_dir().join("rshell_e2e_download.txt");
         let downloaded_bytes = client
-            .download_file(&test_file_remote, tmp_download.to_str().unwrap())
+            .download_file(&test_file_remote, tmp_download.to_str().unwrap(), None, None)
             .await
             .expect("download_file should succeed");
         assert_eq!(downloaded_bytes, upload_content.len() as u64);
@@ -725,19 +817,19 @@ mod tests {
 
     // ---- Regression tests for variable-column LIST formats ----
     //
-    // The original parser used fixed indices `tokens[4..8]` which only worked
+    // The naive parser used fixed indices `tokens[4..8]` which only worked
     // for the strict 9-token "perms links owner group size mon day time name"
     // layout. Real-world FTP servers (notably embedded / arcade-style boxes
     // running busybox or SELinux-enabled distros) emit:
-    //   - 8-token lines (no `group` column)        → silently lost metadata
-    //   - 10+ token lines (SELinux context / ACL)  → name leaked time tokens,
+    //   - 8-token lines (no `group` column)        -> silently lost metadata
+    //   - 10+ token lines (SELinux context / ACL)  -> name leaked time tokens,
     //     producing the exact "12:32 dev" / "2000 Pacman" corruption users saw.
     //
     // These tests lock in the robust from-the-right parsing behaviour.
 
     #[test]
     fn test_parse_ftp_list_line_selinux_context_dir() {
-        // 10 tokens — the bug that produced "12:32 dev" in the file name.
+        // 10 tokens -- the bug that produced "12:32 dev" in the file name.
         let line = "drwxr-xr-x. 2 root root system_u:object_r:default_t 4096 Jan 15 12:32 dev";
         let entry = parse_ftp_list_line(line).expect("should parse");
         assert_eq!(entry.name, "dev");
@@ -753,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_parse_ftp_list_line_selinux_context_file_year() {
-        // 11 tokens — the bug that produced "2000 Pacman" / "2000 gamelist.xml".
+        // 11 tokens -- the bug that produced "2000 Pacman" / "2000 gamelist.xml".
         let line =
             "-rw-r--r--. 1 root root system_u:object_r:default_t 85234 Nov 09  2000 gamelist.xml";
         let entry = parse_ftp_list_line(line).expect("should parse");
@@ -765,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_parse_ftp_list_line_acl_extended() {
-        // ACL `+` suffix on perms — extra columns must not corrupt parsing.
+        // ACL `+` suffix on perms -- extra columns must not corrupt parsing.
         let line = "drwxr-xr-x+  3 root root  4096 Feb 28  2024 with spaces in name";
         let entry = parse_ftp_list_line(line).expect("should parse");
         assert_eq!(entry.name, "with spaces in name");
@@ -775,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_parse_ftp_list_line_no_group_busybox() {
-        // busybox/embedded omit the `group` column → 8 tokens. Must still
+        // busybox/embedded omit the `group` column -> 8 tokens. Must still
         // recover size + modified + permissions rather than falling back.
         let line = "-rw-r--r--   1 root  85234 Jul 27 12:46 gamelist.xml";
         let entry = parse_ftp_list_line(line).expect("should parse");
@@ -827,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_parse_ftp_list_line_total_line_ignored() {
-        // `ls -l` prepends a "total NNN" summary line — must not be parsed as an entry.
+        // `ls -l` prepends a "total NNN" summary line -- must not be parsed as an entry.
         assert!(parse_ftp_list_line("total 123").is_none());
         assert!(parse_ftp_list_line("total 0").is_none());
     }

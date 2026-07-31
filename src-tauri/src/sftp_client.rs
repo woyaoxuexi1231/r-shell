@@ -5,7 +5,102 @@ use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Progress event emitted during file transfers.
+/// The frontend listens for `transfer-progress` events to update the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferProgressEvent {
+    pub transfer_id: String,
+    /// 0.0 – 100.0
+    pub progress: f64,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    /// bytes per second
+    pub speed: f64,
+}
+
+/// Throttled emitter for `transfer-progress` events.
+///
+/// Emitting one event per 32 KiB chunk floods the Tauri IPC bridge with
+/// thousands of events per second, saturating the WebView main thread and
+/// freezing the whole UI (including the file browser). This wrapper caps
+/// emission at one event per `EMIT_INTERVAL`, plus a guaranteed final event
+/// via `finish()`.
+pub struct ProgressEmitter {
+    app_handle: tauri::AppHandle,
+    transfer_id: String,
+    total_bytes: u64,
+    start: std::time::Instant,
+    last_emit: Option<std::time::Instant>,
+}
+
+impl ProgressEmitter {
+    const EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Returns `None` when no app handle / transfer id was supplied,
+    /// i.e. progress reporting is disabled for this transfer.
+    pub fn new(
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+        total_bytes: u64,
+    ) -> Option<Self> {
+        match (app_handle, transfer_id) {
+            (Some(handle), Some(id)) => Some(Self {
+                app_handle: handle.clone(),
+                transfer_id: id.to_string(),
+                total_bytes,
+                start: std::time::Instant::now(),
+                last_emit: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Report progress; the event is dropped unless `EMIT_INTERVAL` has
+    /// elapsed since the previous emission.
+    pub fn report(&mut self, bytes_transferred: u64) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_emit {
+            if now.duration_since(last) < Self::EMIT_INTERVAL {
+                return;
+            }
+        }
+        self.last_emit = Some(now);
+        self.emit(bytes_transferred);
+    }
+
+    /// Always emits, regardless of throttling (final 100% event).
+    pub fn finish(&mut self, bytes_transferred: u64) {
+        self.last_emit = Some(std::time::Instant::now());
+        self.emit(bytes_transferred);
+    }
+
+    fn emit(&self, bytes_transferred: u64) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            bytes_transferred as f64 / elapsed
+        } else {
+            0.0
+        };
+        let progress = if self.total_bytes > 0 {
+            (bytes_transferred as f64 / self.total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = self.app_handle.emit(
+            "transfer-progress",
+            TransferProgressEvent {
+                transfer_id: self.transfer_id.clone(),
+                progress,
+                bytes_transferred,
+                total_bytes: self.total_bytes,
+                speed,
+            },
+        );
+    }
+}
 
 use crate::ssh::Client;
 
@@ -252,7 +347,15 @@ impl StandaloneSftpClient {
     }
 
     /// Download a remote file to a local path. Returns bytes downloaded.
-    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events so the frontend can show real-time progress and speed.
+    pub async fn download_file(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let sftp = self
             .sftp
             .as_ref()
@@ -263,9 +366,14 @@ impl StandaloneSftpClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open remote file '{}': {}", remote_path, e))?;
 
+        // Get total file size for progress calculation
+        let metadata = remote_file.metadata().await?;
+        let total_bytes = metadata.size.unwrap_or(0);
+
         let mut buffer = Vec::new();
         let mut temp_buf = vec![0u8; 32768];
-        let mut total_bytes = 0u64;
+        let mut bytes_read = 0u64;
+        let mut emitter = ProgressEmitter::new(app_handle, transfer_id, total_bytes);
 
         loop {
             let n = remote_file.read(&mut temp_buf).await?;
@@ -273,15 +381,31 @@ impl StandaloneSftpClient {
                 break;
             }
             buffer.extend_from_slice(&temp_buf[..n]);
-            total_bytes += n as u64;
+            bytes_read += n as u64;
+
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.report(bytes_read);
+            }
+        }
+
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.finish(bytes_read);
         }
 
         tokio::fs::write(local_path, buffer).await?;
-        Ok(total_bytes)
+        Ok(bytes_read)
     }
 
     /// Upload a local file to a remote path. Returns bytes uploaded.
-    pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
+    /// When `app_handle` and `transfer_id` are provided, emits `transfer-progress`
+    /// events so the frontend can show real-time progress and speed.
+    pub async fn upload_file(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        app_handle: Option<&tauri::AppHandle>,
+        transfer_id: Option<&str>,
+    ) -> Result<u64> {
         let sftp = self
             .sftp
             .as_ref()
@@ -296,14 +420,24 @@ impl StandaloneSftpClient {
             anyhow::anyhow!("Failed to create remote file '{}': {}", remote_path, e)
         })?;
 
-        let chunk_size = 32768;
-        let mut offset = 0;
+        let chunk_size: usize = 32768;
+        let mut offset: usize = 0;
+        let mut emitter = ProgressEmitter::new(app_handle, transfer_id, total_bytes);
+
         while offset < data.len() {
             let end = std::cmp::min(offset + chunk_size, data.len());
             remote_file.write_all(&data[offset..end]).await?;
             offset = end;
+
+            if let Some(emitter) = emitter.as_mut() {
+                emitter.report(offset as u64);
+            }
         }
         remote_file.flush().await?;
+
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.finish(offset as u64);
+        }
 
         Ok(total_bytes)
     }

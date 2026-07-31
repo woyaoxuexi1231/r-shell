@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useReducer, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
@@ -7,10 +7,13 @@ import { withRetry, CancelledError } from '@/lib/async-retry';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { ScrollArea } from './ui/scroll-area';
+import { getNextQueuedTransfer } from '@/lib/transfer-queue-reducer';
 import {
-  transferQueueReducer,
-  getNextQueuedTransfer,
-} from '@/lib/transfer-queue-reducer';
+  useTransferQueue,
+  ensureTransferProgressListener,
+  tryBeginProcessing,
+  endProcessing,
+} from '@/lib/transfer-store';
 import {
   buildDirectoryUploadPlan,
   buildFileUploadItems,
@@ -116,9 +119,10 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
   const [currentPath, setCurrentPath] = useState('/home');
   const [files, setFiles] = useState<FileItem[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-  const [transfers, dispatchTransfer] = useReducer(transferQueueReducer, []);
+  // Transfers live in a module-level store so records survive unmounts
+  // (hidden bottom panel, zen mode, layout switches).
+  const [transfers, dispatchTransfer] = useTransferQueue(connectionId);
   const [queueExpanded, setQueueExpanded] = useState(false);
-  const processTransferRef = useRef(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showLoadingOverlay, setShowLoadingOverlay] = useState(false);
@@ -368,12 +372,17 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
     };
   }, [resizingColumn]);
 
+  // Register the global transfer-progress listener (kept alive for the app
+  // lifetime, so progress is recorded even while this component is unmounted).
+  useEffect(() => {
+    ensureTransferProgressListener();
+  }, []);
+
   // Transfer processing loop — modeled on file-browser-view.tsx
   useEffect(() => {
     const nextItem = getNextQueuedTransfer(transfers);
-    if (!nextItem || processTransferRef.current) return;
+    if (!nextItem || !tryBeginProcessing(connectionId)) return;
 
-    processTransferRef.current = true;
     dispatchTransfer({ type: "START", id: nextItem.id });
 
     const doTransfer = async () => {
@@ -385,6 +394,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
               connectionId,
               localPath: nextItem.sourcePath,
               remotePath: nextItem.destinationPath,
+              transferId: nextItem.id,
             },
           );
           if (result.success) {
@@ -408,6 +418,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
               connectionId,
               remotePath: nextItem.sourcePath,
               localPath: nextItem.destinationPath,
+              transferId: nextItem.id,
             },
           );
           if (result.success) {
@@ -446,7 +457,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
           description: err instanceof Error ? err.message : String(err),
         });
       } finally {
-        processTransferRef.current = false;
+        endProcessing(connectionId);
       }
     };
 
@@ -569,7 +580,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
             path: targetPath === '/' ? `/${entry.name}` : `${targetPath}/${entry.name}`,
           };
         });
-
+        
         // Add parent directory navigation
         if (targetPath !== '/') {
           parsedFiles.unshift({
