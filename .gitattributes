@@ -1,0 +1,7 @@
+# 文本文件统一 LF（优先级高于 core.autocrlf，所有平台 checkout 一致）
+* text=auto eol=lf
+
+# Windows 脚本必须 CRLF 才能执行
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

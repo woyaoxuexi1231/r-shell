@@ -1,0 +1,31 @@
+# https://editorconfig.org
+# 统一 WSL(Linux/LF) 与 Windows IDEA 远程开发的换行符与缩进行为
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Windows 专属脚本必须保留 CRLF，否则无法执行
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
+[*.{java,py,kt,gradle}]
+indent_style = space
+indent_size = 4
+
+[*.{js,ts,jsx,tsx,vue,json,yml,yaml,css,scss,less,html,sh,sql}]
+indent_style = space
+indent_size = 2
+
+[*.go]
+indent_style = tab
+
+[Makefile]
+indent_style = tab
+
+# Markdown 行尾双空格是合法换行语法，不要清理
+[*.md]
+trim_trailing_whitespace = false
