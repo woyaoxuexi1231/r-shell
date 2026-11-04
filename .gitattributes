@@ -1,7 +1,104 @@
-# 文本文件统一 LF（优先级高于 core.autocrlf，所有平台 checkout 一致）
+# 文本默认 LF（覆盖 core.autocrlf，WSL / Windows / macOS checkout 一致）
 * text=auto eol=lf
 
-# Windows 脚本必须 CRLF 才能执行
+# ---------- 显式文本类型（避免被误判成 binary） ----------
+*.java text eol=lf
+*.kt text eol=lf
+*.kts text eol=lf
+*.groovy text eol=lf
+*.scala text eol=lf
+*.py text eol=lf
+*.pyi text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.vue text eol=lf
+*.css text eol=lf
+*.scss text eol=lf
+*.less text eol=lf
+*.html text eol=lf
+*.htm text eol=lf
+*.svg text eol=lf
+*.xml text eol=lf
+*.xsd text eol=lf
+*.xsl text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.properties text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+*.mdx text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.tsv text eol=lf
+*.http text eol=lf
+*.jsp text eol=lf
+*.gradle text eol=lf
+*.sh text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+Makefile text eol=lf
+*.mk text eol=lf
+*.go text eol=lf
+
+# ---------- Windows 脚本必须 CRLF ----------
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# ---------- 二进制：禁止换行转换 ----------
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.bmp binary
+*.pdf binary
+*.doc binary
+*.docx binary
+*.xls binary
+*.xlsx binary
+*.ppt binary
+*.pptx binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.7z binary
+*.rar binary
+*.jar binary
+*.war binary
+*.ear binary
+*.class binary
+*.o binary
+*.so binary
+*.dll binary
+*.exe binary
+*.dylib binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.mp3 binary
+*.mp4 binary
+*.webm binary
+*.wav binary
+*.p12 binary
+*.pfx binary
+*.jks binary
+*.keystore binary
+*.hprof binary
+*.sqlite binary
+*.db binary

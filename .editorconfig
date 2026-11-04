@@ -1,5 +1,8 @@
 # https://editorconfig.org
-# 统一 WSL(Linux/LF) 与 Windows IDEA 远程开发的换行符与缩进行为
+# 统一 WSL(Linux/LF) 与 Windows IDEA / Cursor Remote 的换行、编码与缩进
+# 优先级：更具体的 section 覆盖更上面的；与 .gitattributes 的 eol 规则配套
+# 约定：[*] 给出全量默认值，以下各段只写与默认不同的属性，避免 section 重叠提示
+
 root = true
 
 [*]
@@ -7,25 +10,51 @@ charset = utf-8
 end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+tab_width = 4
 
-# Windows 专属脚本必须保留 CRLF，否则无法执行
+# ---------- Windows 专属脚本：必须 CRLF，否则 cmd/PowerShell 可能无法执行 ----------
 [*.{bat,cmd,ps1}]
 end_of_line = crlf
 
-[*.{java,py,kt,gradle}]
-indent_style = space
-indent_size = 4
-
-[*.{js,ts,jsx,tsx,vue,json,yml,yaml,css,scss,less,html,sh,sql}]
-indent_style = space
+# ---------- 前端 / Web / 数据交换 / Shell：2 空格 ----------
+[*.{js,mjs,cjs,jsx,ts,tsx,vue,css,scss,less,sass,html,htm,svg}]
 indent_size = 2
+tab_width = 2
 
+[*.{json,jsonc,json5,yml,yaml,toml,ini,cfg,conf}]
+indent_size = 2
+tab_width = 2
+
+[*.{sh,bash,zsh}]
+indent_size = 2
+tab_width = 2
+
+[{Dockerfile,Dockerfile.*,docker-compose.yml,docker-compose.yaml,compose.yml,compose.yaml,.dockerignore}]
+indent_size = 2
+tab_width = 2
+
+[*.{properties,http}]
+indent_size = 2
+tab_width = 2
+
+[*.{txt,csv,tsv,log}]
+indent_size = 2
+tab_width = 2
+
+# ---------- 必须用 Tab 的格式 ----------
 [*.go]
 indent_style = tab
 
-[Makefile]
+[{Makefile,makefile,GNUmakefile,*.mk}]
 indent_style = tab
 
-# Markdown 行尾双空格是合法换行语法，不要清理
-[*.md]
+# ---------- 文档 / 补丁：保留行尾空白语义 ----------
+# Markdown 行尾双空格 = 硬换行，不能 trim
+[*.{md,mdx,markdown}]
+trim_trailing_whitespace = false
+
+# diff/patch 行首空格有语义
+[*.{diff,patch}]
 trim_trailing_whitespace = false
