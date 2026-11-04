@@ -31,14 +31,14 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from './ui/resizable';
-import { 
-  Folder, 
+import {
+  Folder,
   FolderUp,
-  File, 
-  Upload, 
-  Download, 
-  RefreshCw, 
-  Home, 
+  File,
+  Upload,
+  Download,
+  RefreshCw,
+  Home,
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
@@ -149,7 +149,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
   const [renamingFile, setRenamingFile] = useState<FileItem | null>(null);
   const [newFileName, setNewFileName] = useState('');
   const [deletingFile, setDeletingFile] = useState<FileItem | null>(null);
-  
+
   // Column widths state
   const [columnWidths, setColumnWidths] = useState({
     name: 300,
@@ -159,13 +159,13 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
     owner: 110
   });
   const [resizingColumn, setResizingColumn] = useState<string | null>(null);
-  
+
   // Sort state
   type SortField = 'name' | 'size' | 'modified' | 'permissions' | 'owner';
   type SortDirection = 'asc' | 'desc';
   const [sortField, setSortField] = useState<SortField>('name');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
-  
+
   // Drag and drop state — driven by the `useWebviewFileDrop` hook below,
   // which owns the global Tauri `onDragDropEvent` subscription.
 
@@ -341,7 +341,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
       setColumnWidths(prev => {
         const columns = Object.keys(prev);
         const columnIndex = columns.indexOf(resizingColumn);
-        
+
         if (columnIndex === -1) return prev;
 
         // Calculate the start position of the column being resized
@@ -475,14 +475,18 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
   const loadSSHDirectories = useCallback(async (path: string): Promise<string[]> => {
     if (!connectionId || !isConnected) return [];
     try {
-      const entries = await invoke<Array<{ name: string; file_type: 'File' | 'Directory' | 'Symlink' }>>(
-        'list_files',
-        { connectionId, path },
-      );
-      // Backend already filters `.`/`..` and returns structured types.
-      return entries
-        .filter((e) => e.file_type === 'Directory')
-        .map((e) => e.name);
+      const output = await invoke<string>('list_files', { connectionId, path });
+      if (!output) return [];
+      const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('total'));
+      const dirs: string[] = [];
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 8 && parts[0].startsWith('d')) {
+          const name = parts.slice(7).join(' ');
+          if (name && name !== '.' && name !== '..') dirs.push(name);
+        }
+      }
+      return dirs;
     } catch {
       return [];
     }
@@ -531,7 +535,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
       // when isConnected briefly flickers during a tab switch.
       return;
     }
-    
+
     const targetPath = pathOverride ?? currentPath;
     const gen = ++loadGenRef.current;
     const isCancelled = () => gen !== loadGenRef.current;
@@ -544,43 +548,59 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
       // successful await, so stale calls from a previous connection are
       // discarded without showing an error toast.  maxRetries=2 means up
       // to 3 total attempts with 1 s → 2 s backoff.
-      const entries = await withRetry(
-        () => invoke<Array<{ name: string; size: number; modified: string | null; permissions: string | null; file_type: 'File' | 'Directory' | 'Symlink' }>>(
-          'list_files',
-          { connectionId, path: targetPath },
-        ),
+      const output = await withRetry(
+        () => invoke<string>('list_files', { connectionId, path: targetPath }),
         isCancelled,
         { maxRetries: 2, baseDelayMs: 1000 },
       );
 
-      if (entries && entries.length > 0) {
-        // The backend now returns structured FileEntry values (parsed in Rust),
-        // so we no longer need to interpret the `ls -l` column layout here.
-        // The Rust `ls_parser` handles GNU long-iso, BusyBox/BSD default,
-        // ACL/SELinux/no-group variants — see src-tauri/src/ls_parser.rs.
-        const parsedFiles: FileItem[] = entries.map((entry) => {
-          const type: 'directory' | 'file' =
-            entry.file_type === 'Directory' ? 'directory' : 'file';
-          // `modified` is either null or an ISO-style string from the backend
-          // ("YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS"). Replace the space
-          // with "T" so Date parses it as local time, not UTC.
-          let modifiedDate = new Date();
-          if (entry.modified) {
-            const parsed = new Date(entry.modified.replace(' ', 'T'));
-            if (!isNaN(parsed.getTime())) modifiedDate = parsed;
+      if (output && output.trim()) {
+        // Parse ls -la --time-style=long-iso output to FileItem format
+        // Format: perms links owner group size date time filename
+        // Example: drwxr-xr-x  5 root root 72 2025-09-17 03:38 giga-sls
+        const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('total'));
+
+        const parsedFiles: FileItem[] = lines.map(line => {
+          const parts = line.trim().split(/\s+/);
+
+          if (parts.length < 8) {
+            return null;
           }
+
+          const permissions = parts[0];
+          const owner = parts[2];
+          const group = parts[3];
+          const size = parseInt(parts[4]) || 0;
+          // parts[5] is date (YYYY-MM-DD), parts[6] is time (HH:MM), parts[7+] is filename
+          const dateStr = parts[5];
+          const timeStr = parts[6];
+          const name = parts.slice(7).join(' ');
+          const type: 'directory' | 'file' = permissions.startsWith('d') ? 'directory' : 'file';
+
+          // Parse the modification date from ls output
+          let modifiedDate = new Date();
+          if (dateStr && timeStr) {
+            // Combine date and time: "2025-01-15 14:30" -> "2025-01-15T14:30"
+            modifiedDate = new Date(`${dateStr}T${timeStr}`);
+          }
+
+          // Skip . and .. entries
+          if (name === '.' || name === '..') {
+            return null;
+          }
+
           return {
-            name: entry.name,
+            name,
             type,
-            size: entry.size,
+            size,
             modified: modifiedDate,
-            permissions: entry.permissions ?? '',
-            owner: '-',
-            group: '-',
-            path: targetPath === '/' ? `/${entry.name}` : `${targetPath}/${entry.name}`,
+            permissions,
+            owner,
+            group,
+            path: targetPath === '/' ? `/${name}` : `${targetPath}/${name}`
           };
-        });
-        
+        }).filter(f => f !== null);
+
         // Add parent directory navigation
         if (targetPath !== '/') {
           parsedFiles.unshift({
@@ -594,7 +614,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
             path: targetPath.split('/').slice(0, -1).join('/') || '/'
           });
         }
-        
+
         if (gen !== loadGenRef.current) return; // stale — a newer load superseded us
         setFiles(parsedFiles);
         // Sync the breadcrumb path with what was actually loaded.
@@ -752,7 +772,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
     if (file.type === 'directory') {
       return <Folder className="h-4 w-4 text-blue-500" />;
     }
-    
+
     const ext = file.name.split('.').pop()?.toLowerCase();
     switch (ext) {
       case 'txt':
@@ -780,7 +800,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
 
   const handleFileDoubleClick = async (file: FileItem) => {
     console.log('handleFileDoubleClick called', { file, currentPath, connectionId });
-    
+
     if (file.type === 'directory') {
       console.log('Navigating to directory:', file.path);
       navigateTo(file.path);
@@ -811,7 +831,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
 
   const handleFileClick = (file: FileItem, event: React.MouseEvent) => {
     console.log('handleFileClick called', { file, ctrlKey: event.ctrlKey, metaKey: event.metaKey });
-    
+
     if (event.ctrlKey || event.metaKey) {
       // Ctrl/Cmd + Click: toggle selection
       handleFileSelect(file.name, event);
@@ -991,11 +1011,11 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
 
   const confirmDeleteFile = async () => {
     if (!deletingFile) return;
-    
+
     console.log('[FileBrowser] Confirming delete for:', deletingFile.name);
     try {
       const filePath = deletingFile.path;
-      console.log('[FileBrowser] Deleting file', { 
+      console.log('[FileBrowser] Deleting file', {
         filePath,
         isDirectory: deletingFile.type === 'directory',
         connectionId
@@ -1006,7 +1026,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
         path: filePath,
         isDirectory: deletingFile.type === 'directory'
       });
-      
+
       toast.success(t('fileBrowser.toast.deleted', { name: deletingFile.name }));
       setDeletingFile(null);
       void loadFiles();
@@ -1038,7 +1058,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
       try {
         for (const file of clipboard.files) {
           const destPath = currentPath === '/' ? `/${file.name}` : `${currentPath}/${file.name}`;
-          
+
           if (clipboard.operation === 'copy') {
             await invoke<boolean>('copy_file', {
               connectionId,
@@ -1053,7 +1073,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
             });
           }
         }
-        
+
         const operation = clipboard.operation === 'copy' ? 'copied' : 'moved';
         toast.success(t('fileBrowser.toast.pasted', { count: clipboard.files.length, operation }));
         setClipboard(null);
@@ -1077,13 +1097,13 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
       try {
         const oldPath = currentPath === '/' ? `/${renamingFile.name}` : `${currentPath}/${renamingFile.name}`;
         const newPath = currentPath === '/' ? `/${newFileName}` : `${currentPath}/${newFileName}`;
-        
+
         await invoke<boolean>('rename_file', {
           connectionId,
           oldPath: oldPath,
           newPath: newPath
         });
-        
+
         toast.success(t('fileBrowser.toast.renamed', { oldName: renamingFile.name, newName: newFileName }));
         setRenamingFile(null);
         setNewFileName('');
@@ -1138,13 +1158,13 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
     try {
       const sourcePath = file.path;
       const destPath = currentPath === '/' ? `/${newName}` : `${currentPath}/${newName}`;
-      
+
       await invoke<boolean>('copy_file', {
         connectionId,
         sourcePath: sourcePath,
         destPath: destPath
       });
-      
+
       toast.success(t('fileBrowser.toast.duplicated', { name: file.name, newName }));
       void loadFiles();
     } catch (error) {
@@ -1270,7 +1290,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
   // Keep the ref in sync with the latest clearDragOver identity.
   clearDragOverRef.current = clearDragOver;
 
-  const filteredFiles = files.filter(file => 
+  const filteredFiles = files.filter(file =>
     file.name.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
@@ -1288,14 +1308,14 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
     // Always keep ".." at the top
     if (a.name === '..') return -1;
     if (b.name === '..') return 1;
-    
+
     // Always keep directories before files (unless sorting by type explicitly)
     if (a.type !== b.type) {
       return a.type === 'directory' ? -1 : 1;
     }
-    
+
     let comparison = 0;
-    
+
     switch (sortField) {
       case 'name':
         comparison = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
@@ -1313,13 +1333,13 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
         comparison = a.owner.localeCompare(b.owner);
         break;
     }
-    
+
     return sortDirection === 'asc' ? comparison : -comparison;
   });
 
   // Count actual files/folders (excluding ".." navigation entry)
   const actualItemCount = filteredFiles.filter(file => file.name !== '..').length;
-  
+
     // Status footer stats
     const statusStats = useMemo(() => {
       const items = files.filter(f => f.name !== '..');
@@ -1738,7 +1758,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                       <ContextMenuSeparator />
                     </>
                   )}
-                  
+
                   {/* Directory-specific actions */}
                   {file.type === 'directory' && file.name !== '..' && (
                     <>
@@ -1768,7 +1788,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                         </ContextMenuItem>
                       )}
                       <ContextMenuSeparator />
-                      
+
                       <ContextMenuItem onClick={() => handleRenameFile(file)}>
                         <FileEdit className="mr-2 h-4 w-4" />
                         {t('fileBrowser.contextMenu.rename')}
@@ -1812,7 +1832,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                   {file.name !== '..' && (
                     <>
                       <ContextMenuSeparator />
-                      <ContextMenuItem 
+                      <ContextMenuItem
                         className="text-destructive focus:text-destructive"
                         onClick={() => handleDeleteFile(file)}
                       >
@@ -1839,7 +1859,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                 {t('fileBrowser.contextMenu.newFolder')}
               </ContextMenuItem>
               <ContextMenuSeparator />
-              
+
               {clipboard && (
                 <>
                   <ContextMenuItem onClick={handlePasteFiles}>
@@ -1849,7 +1869,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                   <ContextMenuSeparator />
                 </>
               )}
-              
+
               <ContextMenuItem onClick={handleUpload}>
                 <Upload className="mr-2 h-4 w-4" />
                 {t('fileBrowser.contextMenu.upload')}
@@ -1863,7 +1883,7 @@ export function IntegratedFileBrowser({ connectionId, host: _host, isConnected, 
                 {t('fileBrowser.contextMenuRefresh')}
               </ContextMenuItem>
               <ContextMenuSeparator />
-              
+
               <ContextMenuItem onClick={() => setSelectedFiles(new Set())}>
                 <X className="mr-2 h-4 w-4" />
                 {t('fileBrowser.clearSelection')}
